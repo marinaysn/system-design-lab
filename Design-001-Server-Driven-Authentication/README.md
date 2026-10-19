@@ -81,6 +81,132 @@ Decision-making (policy), verification (strategies), transport (API), and presen
 **Dependency Injection** (our choice)
 Policy engine, strategies, and configuration will be supplied through ASP.NET Core's built-in DI container. This enables swapping in test doubles, registering new strategies, and simulating failures in tests.
 
+## 5a. Backend Implementation (Phase 2)
+
+> **Update:** the ASP.NET Core backend (policy engine, strategies, API, tests) is now implemented. **Angular is not implemented yet**, and the "Planned Implementation" and "Hands-On Experiments" sections below still describe future work except where stated here.
+>
+> **This is a simulation.** It selects which challenge to show. It verifies no credentials, issues no tokens, creates no sessions, and never reports a user as authenticated.
+
+### Components implemented
+
+All code lives under `backend/`.
+
+| Component | Location | Responsibility |
+|---|---|---|
+| `IAuthenticationStrategy` + `PasswordStrategy`, `EmailOtpStrategy`, `TotpStrategy` | `src/AuthPolicyEngine.Api/Strategies` | Each method reports its type, display info, and whether it applies to an account. No verification logic. |
+| `IAuthenticationPolicyEngine` / `AuthenticationPolicyEngine` | `.../Policy` | Filters applicable methods, orders them by server-side config, returns the preferred challenge plus alternatives. |
+| `AuthPolicyOptions` | `.../Policy` | Config model (`AuthPolicyOptions`, section `AuthPolicy`). |
+| `InMemoryAccountRepository` | `.../Accounts` | Fictional demo accounts. |
+| `InMemoryAuthFlowStore` | `.../Flows` | Server-held flow state (allowed methods, 10-minute expiry). |
+| `AuthController` | `.../Controllers` | The two endpoints below. |
+| Tests | `tests/AuthPolicyEngine.Tests` | xUnit unit tests and `WebApplicationFactory` integration tests. |
+
+### Design patterns used
+
+- **Policy Engine**: one place decides which challenge is selected, from account data, request context, and configuration.
+- **Strategy**: each authentication method is a separate `IAuthenticationStrategy` registered in DI. Adding a method means adding a class and a registration.
+- **Dependency Injection** and **Options pattern** (`IOptionsMonitor`) for strategies, the engine, and live-reloadable policy.
+
+### Demo accounts
+
+All data is fictional. There are no passwords, secrets, or real credentials.
+
+| Account | Identifier | Eligible methods |
+|---|---|---|
+| A | `account.a@example.test` | Password, Email OTP |
+| B | `account.b@example.test` | Password, TOTP |
+| C | `account.c@example.test` | Email OTP only |
+| D | `account.d@example.test` | None |
+
+### API
+
+Both endpoints return `application/json`. Errors use RFC 7807 `application/problem+json`.
+
+**`POST /api/auth/identify`**
+
+Request: `{ "identifier": "account.a@example.test", "region": "EU" }` (`region` is optional).
+
+Response `200`:
+
+```json
+{
+  "flowId": "3f1c...",
+  "expiresAt": "2026-01-01T00:10:00+00:00",
+  "selectedChallenge": { "type": "Password", "displayName": "Password", "description": "Enter your account password." },
+  "alternatives": [
+    { "type": "EmailOtp", "displayName": "Email code", "description": "Enter a one-time code sent to your email." }
+  ],
+  "notice": "SIMULATION: challenge selection only. ..."
+}
+```
+
+For account D, the response is `200` with `flowId`, `expiresAt`, and `selectedChallenge` all `null` and `alternatives` empty.
+
+| Status | Meaning |
+|---|---|
+| 200 | Policy decision returned (possibly with no challenge). |
+| 400 | Missing, empty, or malformed body or identifier. |
+| 404 | Unknown account. |
+
+**`POST /api/auth/flows/{flowId}/select`**
+
+Request: `{ "authenticationType": "EmailOtp" }`. Valid values: `Password`, `EmailOtp`, `Totp`. Integers are rejected.
+
+Response `200` has the same shape as identify, with the requested method as `selectedChallenge` and the rest as alternatives.
+
+| Status | Meaning |
+|---|---|
+| 400 | Missing or invalid `authenticationType`, or malformed body. |
+| 404 | Unknown flow. |
+| 409 | Method is not in the server's allowed list for this flow. The client cannot authorize arbitrary methods. |
+| 410 | Flow expired (flows live 10 minutes from `identify`; selecting does not extend them). |
+
+### Build, run, test
+
+Requires the .NET 10 SDK.
+
+```powershell
+cd Design-001-Server-Driven-Authentication\backend
+dotnet build
+dotnet run --project src\AuthPolicyEngine.Api --urls http://localhost:5199
+dotnet test
+```
+
+### Sample requests
+
+```powershell
+Invoke-RestMethod -Method Post http://localhost:5199/api/auth/identify `
+  -ContentType application/json -Body '{"identifier":"account.a@example.test"}'
+
+Invoke-RestMethod -Method Post http://localhost:5199/api/auth/flows/<flowId>/select `
+  -ContentType application/json -Body '{"authenticationType":"EmailOtp"}'
+```
+
+### Changing the authentication policy
+
+Edit `backend/src/AuthPolicyEngine.Api/appsettings.json`:
+
+```json
+"AuthPolicy": {
+  "PreferredOrder": [ "Password", "EmailOtp", "Totp" ],
+  "RegionOverrides": { "EU": [ "Totp", "EmailOtp", "Password" ] },
+  "FlowLifetime": "00:10:00"
+}
+```
+
+- `PreferredOrder` is most-preferred first. The engine picks the first method the account actually has, and lists the remaining applicable methods as alternatives in order. Methods left out of the list are appended, so an account's available methods are never dropped.
+- `RegionOverrides` replaces the order when the request's `region` matches (case-insensitive).
+- **Live reload:** the running app picks up saved changes to `appsettings.json` without a restart. This was verified by changing the preferred method while the server ran. Flows already created keep their original allowed methods. `FlowLifetime` applies to flows created after the change.
+
+### Known limitations
+
+- Simulation only: no credential verification, tokens, sessions, or "authenticated" state.
+- Data and flows are in memory and are lost on restart. Flows are not shared across instances.
+- **Account enumeration is not prevented.** `identify` returns `404` for unknown accounts and a distinct response for accounts with no methods, so an attacker can discover which identifiers exist. A production system must return indistinguishable responses and protect this endpoint.
+- Also missing for production: secure credential validation, rate limiting and lockout, replay protection and single-use flow handling, auditing and logging, HTTPS and CSRF/CORS hardening, and secure flow-ID handling. Expiry here is a simple fixed 10 minutes.
+- No Angular client yet.
+- Strategy execution and challenge delivery (sending emails, validating codes) are out of scope.
+
 ## 6. Planned Implementation
 
 Planned technology stack:
