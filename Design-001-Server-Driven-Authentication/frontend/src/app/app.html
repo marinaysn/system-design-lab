@@ -1,0 +1,32 @@
+<main class="shell">
+  <header>
+    <h1>Server-Driven Authentication</h1>
+    <p class="sim-banner" role="note" data-testid="sim-banner">
+      SIMULATION — this demo only shows which challenge the server selects. No credentials are
+      collected or verified, and no one is signed in.
+    </p>
+  </header>
+
+  @if (error(); as err) {
+    <div class="error" role="alert" data-testid="error">
+      <p>{{ err.message }}</p>
+      @if (err.restartRequired) {
+        <button type="button" class="primary" (click)="restart()">Start new flow</button>
+      }
+    </div>
+  }
+
+  @if (response(); as r) {
+    <app-challenge-panel
+      [response]="r"
+      [busy]="busy()"
+      (alternativeSelected)="selectAlternative($event)"
+      (restart)="restart()"
+    />
+    @if (r.notice) {
+      <p class="meta" data-testid="server-notice">Server notice: {{ r.notice }}</p>
+    }
+  } @else {
+    <app-identify-form [busy]="busy()" (submitted)="identify($event)" />
+  }
+</main>

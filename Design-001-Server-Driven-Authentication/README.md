@@ -83,7 +83,7 @@ Policy engine, strategies, and configuration will be supplied through ASP.NET Co
 
 ## 5a. Backend Implementation (Phase 2)
 
-> **Update:** the ASP.NET Core backend (policy engine, strategies, API, tests) is now implemented. **Angular is not implemented yet**, and the "Planned Implementation" and "Hands-On Experiments" sections below still describe future work except where stated here.
+> **Update:** the ASP.NET Core backend (policy engine, strategies, API, tests) is implemented, and an Angular client is described in section 5b. The "Planned Implementation" and "Hands-On Experiments" sections below still describe future work except where stated in 5a and 5b.
 >
 > **This is a simulation.** It selects which challenge to show. It verifies no credentials, issues no tokens, creates no sessions, and never reports a user as authenticated.
 
@@ -204,8 +204,85 @@ Edit `backend/src/AuthPolicyEngine.Api/appsettings.json`:
 - Data and flows are in memory and are lost on restart. Flows are not shared across instances.
 - **Account enumeration is not prevented.** `identify` returns `404` for unknown accounts and a distinct response for accounts with no methods, so an attacker can discover which identifiers exist. A production system must return indistinguishable responses and protect this endpoint.
 - Also missing for production: secure credential validation, rate limiting and lockout, replay protection and single-use flow handling, auditing and logging, HTTPS and CSRF/CORS hardening, and secure flow-ID handling. Expiry here is a simple fixed 10 minutes.
-- No Angular client yet.
+- Angular client: see section 5b.
 - Strategy execution and challenge delivery (sending emails, validating codes) are out of scope.
+
+## 5b. Angular Client (Phase 3)
+
+> **Still a simulation.** The client shows which challenge the server selected. It collects no credentials, holds no tokens or sessions, and never says a user is signed in.
+
+Code lives under `frontend/` (Angular 22, standalone components, `HttpClient`, Vitest via `ng test`; no extra runtime dependencies).
+
+### How it works
+
+The client contains no policy. It never decides priority, never looks at account properties, and has no preferred order. It only does this:
+
+1. `POST /api/auth/identify` with the identifier and optional region.
+2. Renders `selectedChallenge` and the `alternatives` array exactly as returned, in the server's order.
+3. On "Try another way", `POST /api/auth/flows/{flowId}/select` and renders the new response.
+
+Structure:
+
+| Piece | File | Role |
+|---|---|---|
+| Contracts | `src/app/models/auth.models.ts` | Types mirroring the backend DTOs. Challenge `type` is a string so unknown future types do not break the client. |
+| `AuthApiService` | `src/app/services/auth-api.service.ts` | Typed HTTP calls, response validation, HTTP-status to message mapping. |
+| `IdentifyFormComponent` | `src/app/components/` | Identifier, region, demo account shortcuts A-D (these only fill the input). |
+| `ChallengePanelComponent` | `src/app/components/` | Selected challenge, alternatives, expiry countdown, no-methods state. |
+| `App` | `src/app/app.ts` | Holds the current server response and error. |
+
+Graceful handling: a challenge type the client has no look for (for example a future `Passkey`) is still displayed using the server's text with a warning; unsupported alternatives are shown but disabled. Malformed `200` responses are rejected with an error rather than rendered. Errors handled: unknown account (404), invalid request (400), unknown flow (404 on select), disallowed method (409), expired flow (410), backend unreachable, unexpected responses. Expired or unknown flows offer "Start new flow". The expiry countdown uses the browser clock; the server remains the authority and answers `410` once the flow expires.
+
+### Run backend and frontend together
+
+Requires Node.js 20+ (tested on 24) and the .NET 10 SDK. One-time: `dotnet dev-certs https --trust`.
+
+```powershell
+# Terminal 1 - backend (HTTPS, dev certificate)
+cd Design-001-Server-Driven-Authentication\backend
+dotnet run --project src\AuthPolicyEngine.Api --urls https://localhost:5001
+
+# Terminal 2 - frontend
+cd Design-001-Server-Driven-Authentication\frontend
+npm install
+npm start
+```
+
+Open `http://localhost:4200`. Pick a demo account (A to D, see 5a) and press Continue.
+
+### API integration
+
+Angular calls relative `/api/...` URLs. `npm start` runs the dev server with `proxy.conf.js`, which forwards `/api` to `https://localhost:5001`, so no CORS change was made to the backend. TLS verification stays on: `npm start` runs Node with `--use-system-ca` so it trusts the ASP.NET dev certificate once it is trusted in the OS store. To use another backend address set `API_TARGET` before `npm start` (for example `$env:API_TARGET = "https://localhost:7001"`); no code changes are needed. The proxy is for development only. A deployed setup needs a reverse proxy or a CORS policy.
+
+### Live policy change experiment
+
+1. Start the backend and `npm start` as above, open `http://localhost:4200`.
+2. Identify **Account A**. With `PreferredOrder` of `Password, EmailOtp, Totp`, the server selects **Password**.
+3. In `backend/src/AuthPolicyEngine.Api/appsettings.json`, change `PreferredOrder` to `[ "EmailOtp", "Password", "Totp" ]` and save. Do not restart anything.
+4. In the UI choose "Start over", identify Account A again. It now shows **Email code**, with Password as the alternative.
+5. Revert the file when done.
+
+This was run against the live servers (through the Angular dev-server proxy, with the Angular app untouched): Password before the edit, EmailOtp after, Password after the revert. The browser UI itself was not driven by an automated browser test; UI rendering is covered by the unit tests below.
+
+### Run tests
+
+```powershell
+cd Design-001-Server-Driven-Authentication\frontend
+npm run build
+npm test -- --watch=false      # 17 tests, HTTP mocked, no backend needed
+
+cd ..\backend
+dotnet test                    # 26 backend tests
+```
+
+### Frontend limitations
+
+- No real authentication: no credential input, verification, tokens, or sessions.
+- No end-to-end browser tests; component tests mock HTTP.
+- The dev proxy and `--use-system-ca` setup is for local development only.
+- A new flow is the only way to pick up a changed server policy; open flows keep their original allowed methods.
+- The icon set only knows Password, EmailOtp and Totp; other types use a generic look.
+- Account enumeration (see 5a) is visible in the UI: unknown accounts show a distinct message.
 
 ## 6. Planned Implementation
 
