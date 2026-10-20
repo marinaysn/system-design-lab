@@ -23,6 +23,27 @@ builder.Services.AddSingleton<IAuthenticationPolicyEngine, AuthenticationPolicyE
 
 var app = builder.Build();
 
+// Development-only diagnostic: reports which backend instance handled the request.
+// The id is an operator-chosen label (Instance:Id), never user data or a secret.
+if (app.Environment.IsDevelopment())
+{
+    var instanceId = app.Configuration["Instance:Id"] ?? "instance-local";
+    app.Use(async (context, next) =>
+    {
+        context.Response.OnStarting(() =>
+        {
+            context.Response.Headers["X-Instance-Id"] = instanceId;
+            return Task.CompletedTask;
+        });
+        app.Logger.LogInformation("Instance {InstanceId} handling {Method} {Path}",
+            instanceId, context.Request.Method, context.Request.Path);
+        await next();
+    });
+}
+
+// Used by the reverse proxy's active health checks.
+app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
+
 app.MapControllers();
 app.Run();
 

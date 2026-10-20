@@ -83,7 +83,7 @@ Policy engine, strategies, and configuration will be supplied through ASP.NET Co
 
 ## 5a. Backend Implementation (Phase 2)
 
-> **Update:** the ASP.NET Core backend (policy engine, strategies, API, tests) is implemented, and an Angular client is described in section 5b. The "Planned Implementation" and "Hands-On Experiments" sections below still describe future work except where stated in 5a and 5b.
+> **Update:** the ASP.NET Core backend (policy engine, strategies, API, tests) is implemented, an Angular client is described in section 5b, and a three-instance YARP proxy setup with sticky sessions is described in section 5c. The "Planned Implementation" and "Hands-On Experiments" sections below still describe future work except where stated in 5a and 5b.
 >
 > **This is a simulation.** It selects which challenge to show. It verifies no credentials, issues no tokens, creates no sessions, and never reports a user as authenticated.
 
@@ -201,7 +201,7 @@ Edit `backend/src/AuthPolicyEngine.Api/appsettings.json`:
 ### Known limitations
 
 - Simulation only: no credential verification, tokens, sessions, or "authenticated" state.
-- Data and flows are in memory and are lost on restart. Flows are not shared across instances.
+- Data and flows are in memory and are lost on restart. Flows are not shared across instances (see 5c for what that means behind a load balancer).
 - **Account enumeration is not prevented.** `identify` returns `404` for unknown accounts and a distinct response for accounts with no methods, so an attacker can discover which identifiers exist. A production system must return indistinguishable responses and protect this endpoint.
 - Also missing for production: secure credential validation, rate limiting and lockout, replay protection and single-use flow handling, auditing and logging, HTTPS and CSRF/CORS hardening, and secure flow-ID handling. Expiry here is a simple fixed 10 minutes.
 - Angular client: see section 5b.
@@ -283,6 +283,100 @@ dotnet test                    # 26 backend tests
 - A new flow is the only way to pick up a changed server policy; open flows keep their original allowed methods.
 - The icon set only knows Password, EmailOtp and Totp; other types use a generic look.
 - Account enumeration (see 5a) is visible in the UI: unknown accounts show a distinct message.
+
+## 5c. Distributed Backend with Sticky Sessions (Phase 4)
+
+> **Still a simulation.** Nothing here authenticates anyone. The affinity cookie is a routing hint only and is not a session, token, or proof of identity.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    B[Angular / client] -->|https :5100 or dev proxy :4200| P[YARP proxy<br/>AuthPolicyEngine.Proxy]
+    P -->|round-robin + affinity cookie| I1[API instance-1 :5101<br/>own flow store]
+    P --> I2[API instance-2 :5102<br/>own flow store]
+    P --> I3[API instance-3 :5103<br/>own flow store]
+```
+
+- `src/AuthPolicyEngine.Proxy`: ASP.NET Core + [YARP](https://github.com/dotnet/yarp) (`Yarp.ReverseProxy`, Microsoft, open source). Everything (destinations, load balancing, affinity, health checks) is in its `appsettings.json` under `ReverseProxy`.
+- Three copies of the unchanged API run on `https://localhost:5101-5103`. Each keeps its **own in-memory `IAuthFlowStore`**. There is no shared state and no Redis, on purpose.
+- Small API additions: a `GET /health` endpoint for health checks, and (Development only) an `X-Instance-Id` response header plus a log line `Instance {InstanceId} handling {Method} {Path}`. The id is an operator-chosen label (`Instance:Id`), not user data. Policy engine, strategies, and API contracts are unchanged.
+
+### Why local in-memory flow state fails across instances
+
+`POST /identify` stores the flow (allowed methods, expiry) in the memory of whichever instance handled it. With plain round-robin, the next request for that flow usually lands on a different instance, which has never heard of the flow ID, so `select` returns `404` "Flow not found". The client did nothing wrong; the system's state is simply not shared.
+
+### How sticky sessions work
+
+With affinity on, the first response from YARP carries a cookie `.AuthPolicyEngine.Affinity` that encodes which destination handled the request (protected by ASP.NET Data Protection, so the value is opaque). The browser sends it back, and YARP routes to that same destination while it is healthy. Cookie settings: `HttpOnly`, `Secure`, `SameSite=Lax`. Browsers accept `Secure` cookies on `http://localhost`, so the Angular dev server on port 4200 works. Toggle it with `ReverseProxy:Clusters:authcluster:SessionAffinity:Enabled`.
+
+Before (no affinity):
+
+```
+identify  -> proxy -> instance-1   (flow stored in instance-1 memory)
+select    -> proxy -> instance-3   (404 unknown flow)
+```
+
+After (affinity on):
+
+```
+identify  -> proxy -> instance-1   (Set-Cookie: affinity -> instance-1)
+select    (+cookie) -> proxy -> instance-1   (200)
+```
+
+### Start and stop
+
+Requires the .NET 10 SDK and a trusted dev certificate (`dotnet dev-certs https --trust`, once). TLS verification is **not** disabled anywhere; YARP validates the backends' certificates.
+
+```powershell
+cd Design-001-Server-Driven-Authentication\backend
+.\scripts\start-demo.ps1 -Affinity On      # or -Affinity Off; builds, starts 3 APIs + proxy
+.\scripts\probe-flow.ps1 -Rounds 6          # identify + select per fresh client, prints instance ids
+.\scripts\stop-demo.ps1                     # stop all demo processes
+.\scripts\stop-demo.ps1 -Instance 2         # stop only instance-2 (failure simulation)
+```
+
+The scripts record the PIDs they start in `scripts\.demo-pids.json` and only stop those (verified by process name and start time). Logs go to `scripts\.logs\`. Start refuses to run if ports 5100-5103 are in use.
+
+To use Angular through the proxy: `$env:API_TARGET = "https://localhost:5100"; npm start` in `frontend`. Without `API_TARGET` it still goes directly to one backend at `https://localhost:5001`.
+
+### Hands-on experiments (with results observed on this machine)
+
+**A - No affinity.** `start-demo.ps1 -Affinity Off`, then `probe-flow.ps1`. Observed, 6 of 6 rounds: identify on instance-N, select on a different instance, `404`. Example: identify `[instance-1]` -> select `[instance-3]` 404; identify `[instance-2]` -> select `[instance-1]` 404. No cookie is issued. Which instance gets the second request depends on round-robin position, so a flow can occasionally succeed by luck when other traffic shifts the rotation.
+
+**B - Sticky sessions.** `stop-demo.ps1`, `start-demo.ps1 -Affinity On`, then `probe-flow.ps1` (each round uses a fresh cookie jar). Observed, 6 of 6 rounds: identify and select on the same instance, `200`; new clients still spread across instances 1, 3, 2, 1, 3, 2. Angular through YARP (`API_TARGET=https://localhost:5100`, dev server on 4200) also worked: 4 of 4 rounds stayed on one instance with `200`. The browser UI itself was not driven by an automated browser; the Angular unit tests still pass (17).
+
+**C - Instance failure.** With affinity on, create a flow (it landed on instance-1), then `stop-demo.ps1 -Instance 1`, and keep calling `select` once per second with the same client. Observed timeline:
+
+| Time after stop | Result |
+|---|---|
+| about 4 s | `502` from the proxy (call blocked trying to reach the dead instance) |
+| about 12 s | `502` again (health state had not changed yet; each failing call took several seconds) |
+| about 13 s onward | `404` from `instance-2`: the proxy redistributed, instance-2 is healthy but has no such flow |
+
+Then, with the same client holding the stale cookie: a new `identify` returned `200` on instance-2, a `select` on the new flow returned `200`, and a `select` on the old flow still returned `404`. The Angular client maps `404` on select to "flow no longer exists" and offers "Start new flow", so the user can restart. Exact timings depend on the health check interval (3 s), the threshold of 2 consecutive failures, passive health, and how long connection attempts to a dead localhost port take; treat them as one observation, not a guarantee.
+
+### Failure handling configured
+
+- `HealthCheck`: active checks on `/health` every 3 s (2 s timeout, unhealthy after 2 consecutive failures), plus passive transport-failure detection with a 10 s reactivation period.
+- `SessionAffinity:FailurePolicy` is `Redistribute`: if the affinity destination is unhealthy or gone, YARP picks another healthy destination and issues a new cookie. The alternative `Return503IfDestinationUnavailable` fails fast instead, which can be safer when work cannot continue elsewhere, but still does not recover the flow.
+
+### Advantages and limitations
+
+Advantages: no code change in the API's flow logic, simple, cheap, and works for per-flow state that is short-lived.
+
+Limitations and failure behavior:
+
+- **Sticky sessions do not preserve state when an instance dies.** The cookie only remembers *where* the flow lived. The flow itself lived only in that process's memory, so when the instance stops, restarts, or is replaced, the flow is gone. Another instance cannot recover it, and the user must start a new flow.
+- Load can become uneven (a busy client stays pinned).
+- Requests in flight during the health-check transition can fail with `502`/`503`.
+- Scaling in or deploying instances drops their flows.
+- A real fix for durability is shared or distributed state (for example a distributed cache or database) or stateless signed flow tokens; that is intentionally not implemented here.
+- Development setup only: self-signed certificates, local ports, in-memory state, and no authentication of the proxy-to-backend hop.
+
+### Phase 4 tests
+
+`dotnet test` in `backend` includes 7 new tests: proxy configuration (3 HTTPS destinations, RoundRobin, health checks, secure and HttpOnly affinity cookie, redistribute policy), routing behavior through the real proxy config in front of three isolated API instances (spread and `404` without affinity; same instance and `200` with affinity; cookie contains no flow ID or identifier), instance header present in Development and absent in Production, and `/health`. The failure experiment (C) is manual because it needs a real stopped process.
 
 ## 6. Planned Implementation
 

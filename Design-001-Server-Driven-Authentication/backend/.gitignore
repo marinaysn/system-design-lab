@@ -1,2 +1,4 @@
 bin/
 obj/
+scripts/.logs/
+scripts/.demo-pids.json

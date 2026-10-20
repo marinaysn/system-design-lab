@@ -12,6 +12,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Real proxy configuration, copied so tests assert on what the proxy actually uses. -->
+    <Content Include="..\..\src\AuthPolicyEngine.Proxy\appsettings.json" Link="proxy.appsettings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\AuthPolicyEngine.Api\AuthPolicyEngine.Api.csproj" />
   </ItemGroup>
 
@@ -23,6 +28,7 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
+    <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
   </ItemGroup>
 
 </Project>
